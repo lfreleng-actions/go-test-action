@@ -78,6 +78,35 @@ jobs:
           artifact_upload: 'true'
           artifact_name: go-coverage-synthetic
 
+      # cli-test compiles the binary before exercising it, standing in
+      # for projects that must build before they can test; naming two
+      # targets also covers multi-word make_args
+      - name: "Running local action: build+test via make"
+        id: make-test
+        uses: $/
+        with:
+          path_prefix: test-project
+          make_args: 'cli-test test'
+
+      # A missing target makes make exit non-zero whatever the fixture
+      # code does, so the make path's permit_fail handling is tested
+      # deterministically
+      - name: "Running local action: make soft fail"
+        id: make-soft-fail
+        uses: $/
+        with:
+          path_prefix: test-project
+          make_args: 'no-such-target'
+          permit_fail: 'true'
+
+      - name: "Running local action: make hard fail"
+        id: make-hard-fail
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: test-project
+          make_args: 'no-such-target'
+
       - name: "Verify test outputs"
         shell: bash
         env:
@@ -87,6 +116,12 @@ jobs:
           PLAIN_PASSED: ${{ steps.plain-test.outputs.tests_passed }}
           PLAIN_COVERAGE: >-
             ${{ steps.plain-test.outputs.coverage_percent }}
+          MAKE_PASSED: ${{ steps.make-test.outputs.tests_passed }}
+          MAKE_COVERAGE: ${{ steps.make-test.outputs.coverage_percent }}
+          MAKE_SOFT_OUTCOME: ${{ steps.make-soft-fail.outcome }}
+          MAKE_SOFT_PASSED: >-
+            ${{ steps.make-soft-fail.outputs.tests_passed }}
+          MAKE_HARD_OUTCOME: ${{ steps.make-hard-fail.outcome }}
         run: |
           # Verify test outputs
           errors=0
@@ -108,6 +143,28 @@ jobs:
           fi
           if [ -n "${PLAIN_COVERAGE}" ]; then
             echo "Plain run: unexpected coverage output ❌"
+            errors=1
+          fi
+          if [ "${MAKE_PASSED}" != "true" ]; then
+            echo "make run: tests_passed not true ❌"
+            errors=1
+          fi
+          # The Makefile controls the make path, so the action reports
+          # no coverage there
+          if [ -n "${MAKE_COVERAGE}" ]; then
+            echo "make run: unexpected coverage output ❌"
+            errors=1
+          fi
+          if [ "${MAKE_SOFT_OUTCOME}" != "success" ]; then
+            echo "make soft-fail run unexpectedly failed ❌"
+            errors=1
+          fi
+          if [ "${MAKE_SOFT_PASSED}" != "false" ]; then
+            echo "make soft-fail run: tests_passed not false ❌"
+            errors=1
+          fi
+          if [ "${MAKE_HARD_OUTCOME}" = "success" ]; then
+            echo "make hard-fail run unexpectedly succeeded ❌"
             errors=1
           fi
           if [ "${errors}" != "0" ]; then
@@ -191,18 +248,6 @@ jobs:
           test_target: './internal/...'
           race: 'false'
 
-      # The make_args path runs the project's own Makefile via
-      # make-action, which compiles the mock plugin before 'go test'.
-      # That satisfies the internal/app tests that fail on the plain
-      # go test path above, so the full suite passes end-to-end.
-      - name: "Running local action: build+test via make"
-        id: make-test
-        uses: $/
-        with:
-          path_prefix: test-project/src/k8splugin
-          go_version: '1.25.11'
-          make_args: 'test'
-
       - name: "Verify soft/hard failure semantics"
         shell: bash
         env:
@@ -212,8 +257,6 @@ jobs:
           SOFT_OUTCOME: ${{ steps.soft-fail.outcome }}
           SOFT_PASSED: ${{ steps.soft-fail.outputs.tests_passed }}
           HARD_OUTCOME: ${{ steps.hard-fail.outcome }}
-          MAKE_OUTCOME: ${{ steps.make-test.outcome }}
-          MAKE_PASSED: ${{ steps.make-test.outputs.tests_passed }}
         run: |
           # Verify soft/hard failure semantics
           errors=0
@@ -235,16 +278,6 @@ jobs:
           fi
           if [ "${HARD_OUTCOME}" = "success" ]; then
             echo "Hard-fail run unexpectedly succeeded ❌"
-            errors=1
-          fi
-          # The make_args path must compile the plugin and pass the
-          # full suite, including internal/app
-          if [ "${MAKE_OUTCOME}" != "success" ]; then
-            echo "make run unexpectedly failed ❌"
-            errors=1
-          fi
-          if [ "${MAKE_PASSED}" != "true" ]; then
-            echo "make run: tests_passed not true ❌"
             errors=1
           fi
           if [ "${errors}" != "0" ]; then
