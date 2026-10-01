@@ -227,7 +227,10 @@ jobs:
       # The internal/app package tests require a pre-compiled mock
       # plugin absent from the repository, so the full internal tree
       # fails deterministically: the exact case the permit_fail
-      # soft-fail mode covers
+      # soft-fail mode covers. The failing suite finishes in seconds,
+      # but TestRollbackConfig can deadlock (an ONAP bug); the short
+      # timeout bounds a hang, which these steps tolerate since they
+      # expect failure
       - name: "Running local action: soft fail on failing suite"
         id: soft-fail
         uses: $/
@@ -236,6 +239,7 @@ jobs:
           go_version: '1.25.11'
           test_target: './internal/...'
           race: 'false'
+          timeout: '3m'
           permit_fail: 'true'
 
       - name: "Running local action: hard fail on failing suite"
@@ -247,6 +251,7 @@ jobs:
           go_version: '1.25.11'
           test_target: './internal/...'
           race: 'false'
+          timeout: '3m'
 
       - name: "Verify soft/hard failure semantics"
         shell: bash
