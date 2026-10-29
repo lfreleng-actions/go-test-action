@@ -51,13 +51,16 @@ steps:
 
 ## Requirements
 
-The action needs `realpath` (GNU coreutils) and `awk` on the runner.
-GitHub-hosted Ubuntu runners include them; minimal self-hosted or
-non-Linux runners must provide them. The action installs the Go
-toolchain via the pinned `actions/setup-go`, with caching off per
-organisation security policy, so runners need egress to the Go
-distribution endpoints and, for module downloads during the test
-build, to `proxy.golang.org` and `sum.golang.org`.
+The action needs `bash`, `awk` and either GNU `realpath` or
+`readlink` on the runner. It resolves paths with GNU `realpath` where
+that supports `-m` (Linux, and Git Bash on Windows) and otherwise falls
+back to a `bash` resolver built on `readlink`, so macOS runners need no
+GNU coreutils. GitHub-hosted Linux, macOS and Windows runners include
+these tools; minimal self-hosted runners must provide them. The action
+installs the Go toolchain via the pinned `actions/setup-go`, with
+caching off per organisation security policy, so runners need egress
+to the Go distribution endpoints and, for module downloads during the
+test build, to `proxy.golang.org` and `sum.golang.org`.
 
 ## Inputs
 

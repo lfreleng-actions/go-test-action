@@ -22,8 +22,14 @@ permissions: {}
 jobs:
   ### Test runs against the synthetic Go fixture ###
   test-synthetic:
-    name: "Test: synthetic fixture (test-go-project)"
-    runs-on: ubuntu-latest
+    name: "Test: synthetic fixture (test-go-project, ${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS runs the pure-bash path resolver, since BSD realpath
+        # lacks -m; Windows runs GNU realpath from Git Bash
+        os: [ubuntu-latest, macos-latest, windows-latest]
     permissions:
       contents: read
     timeout-minutes: 15
@@ -31,15 +37,18 @@ jobs:
       # Load the egress allow-list out-of-band from the
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # Both harden-runner actions support Linux runners only.
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
+        if: runner.os == 'Linux'
         with:
           config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
+        if: runner.os == 'Linux'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -76,7 +85,7 @@ jobs:
         with:
           path_prefix: test-project
           artifact_upload: 'true'
-          artifact_name: go-coverage-synthetic
+          artifact_name: go-coverage-synthetic-${{ matrix.os }}
 
       # cli-test compiles the binary before exercising it, standing in
       # for projects that must build before they can test; naming two
@@ -197,7 +206,7 @@ jobs:
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -296,8 +305,12 @@ jobs:
 
   ### Test invalid inputs fail closed ###
   test-failures:
-    name: "Test: invalid inputs and error handling"
-    runs-on: ubuntu-latest
+    name: "Test: invalid inputs and error handling (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     permissions:
       contents: read
     timeout-minutes: 10
@@ -305,15 +318,18 @@ jobs:
       # Load the egress allow-list out-of-band from the
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # Both harden-runner actions support Linux runners only.
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
+        if: runner.os == 'Linux'
         with:
           config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
+        if: runner.os == 'Linux'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -339,6 +355,146 @@ jobs:
         uses: $/
         with:
           path_prefix: /etc
+
+      # Symlinks pointing outside the workspace and project exercise
+      # the re-check after symlink resolution, and dotdot-project,
+      # beside the workspace, is the target of the dot-dot escape.
+      # The targets are runnable Go modules with passing tests, so
+      # only the boundary checks can reject them. resolve-project
+      # checks that the macOS fallback resolver and GNU realpath pick
+      # the same version file. Git Bash copies rather than links
+      # unless native symlinks are available, so Windows skips the
+      # symlink cases when it cannot create real ones
+      - name: "Create symlink fixtures"
+        id: links
+        shell: bash
+        env:
+          MSYS: winsymlinks:nativestrict
+        run: |
+          # Create symlink fixtures
+          # write_module DIR MODULE GO_VERSION [PACKAGE] writes a
+          # go.mod and, given PACKAGE, a passing test
+          write_module() {
+            mkdir -p "$1"
+            printf 'module %s\n\ngo %s\n' "$2" "$3" > "$1/go.mod"
+            if [ -n "${4:-}" ]; then
+              printf '%s\n' "package $4" "" 'import "testing"' "" \
+                'func TestFixture(t *testing.T) {}' \
+                > "$1/${4}_test.go"
+            fi
+          }
+          outside="${RUNNER_TEMP}/outside-project"
+          mkdir -p fixture-dir
+          write_module "${outside}" example.com/outside 1.25 outside
+          # fixture-dir/../../dotdot-project, from the workspace
+          write_module ../dotdot-project example.com/dotdot 1.25 dotdot
+          write_module link-project example.com/linkproject 1.25 \
+            linkproject
+          # The project's own go.mod and nested/go.mod name different
+          # Go versions, so the version installed shows which one the
+          # action resolved
+          write_module resolve-project example.com/resolveproject \
+            1.24 resolveproject
+          write_module resolve-project/nested example.com/nested 1.25
+          write_module resolve-project/nested/child \
+            example.com/child 1.25
+          if ln -s "${outside}" escape-link &&
+            ln -s "${outside}/go.mod" link-project/version-link &&
+            ln -s nested/child resolve-project/link &&
+            [ -L escape-link ] && [ -L link-project/version-link ] &&
+            [ -L resolve-project/link ]; then
+            echo "symlinks=true" >> "$GITHUB_OUTPUT"
+          elif [ "${RUNNER_OS}" = "Windows" ]; then
+            echo "::notice::No native symlinks; skipping symlink cases"
+            echo "symlinks=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Error: failed to create symlink fixtures ❌"
+            exit 1
+          fi
+
+      - name: "Running local action with dot-dot escaping path"
+        id: escape-dotdot
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: fixture-dir/../../dotdot-project
+
+      - name: "Running local action with symlink escaping workspace"
+        id: escape-symlink
+        if: steps.links.outputs.symlinks == 'true'
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: escape-link
+
+      - name: "Running local action with symlink go_version_file"
+        id: escape-version-file
+        if: steps.links.outputs.symlinks == 'true'
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: link-project
+          go_version_file: version-link
+
+      # Positive control: the escape fixtures are runnable, so their
+      # rejections above come from the boundary checks alone
+      - name: "Running local action on symlink fixture project"
+        id: fixture-control
+        if: steps.links.outputs.symlinks == 'true'
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: link-project
+
+      # GNU 'realpath -m' resolves link after the missing component's
+      # '..', selecting nested/go.mod (go 1.25), not the project's
+      # go.mod (go 1.24); the macOS fallback must agree
+      - name: "Running local action with dot-dot through a symlink"
+        id: resolve-dotdot
+        if: steps.links.outputs.symlinks == 'true'
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: resolve-project
+          go_version_file: absent/../link/../go.mod
+
+      - name: "Verify fixture runs and resolved Go version"
+        if: steps.links.outputs.symlinks == 'true'
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        env:
+          CONTROL_OUTCOME: ${{ steps.fixture-control.outcome }}
+          RESOLVE_OUTCOME: ${{ steps.resolve-dotdot.outcome }}
+        run: |
+          # Verify fixture runs and resolved Go version
+          errors=0
+          for outcome_pair in \
+            "fixture_control:${CONTROL_OUTCOME}" \
+            "resolve_dotdot:${RESOLVE_OUTCOME}"; do
+            test_name="${outcome_pair%%:*}"
+            outcome="${outcome_pair#*:}"
+            if [ "${outcome}" != "success" ]; then
+              echo "Valid ${test_name} run failed: ${outcome} ❌"
+              errors=1
+            fi
+          done
+          # Outside any module, so go.mod cannot switch toolchains
+          go_version="$(GOTOOLCHAIN=local go env GOVERSION)" ||
+            go_version=""
+          case "${go_version}" in
+            go1.25|go1.25.*)
+              echo "Resolved nested/go.mod: ${go_version} ✅" ;;
+            *)
+              echo "Expected go1.25 from nested/go.mod ❌"
+              echo "Installed: ${go_version:-none}"
+              errors=1 ;;
+          esac
+          if [ "${errors}" != "0" ]; then
+            echo "Valid-path tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Fixture runs and resolved Go version verified ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
 
       - name: "Running local action with invalid boolean"
         id: bad-bool
@@ -368,6 +524,9 @@ jobs:
           ARGS_OUTCOME: ${{ steps.bad-args.outcome }}
           TIMEOUT_OUTCOME: ${{ steps.bad-timeout.outcome }}
           ESCAPE_OUTCOME: ${{ steps.escape-path.outcome }}
+          DOTDOT_OUTCOME: ${{ steps.escape-dotdot.outcome }}
+          SYMLINK_OUTCOME: ${{ steps.escape-symlink.outcome }}
+          VERSION_FILE_OUTCOME: ${{ steps.escape-version-file.outcome }}
           BOOL_OUTCOME: ${{ steps.bad-bool.outcome }}
           UPLOAD_OUTCOME: ${{ steps.upload-no-coverage.outcome }}
           TARGET_OUTCOME: ${{ steps.bad-target.outcome }}
@@ -378,6 +537,9 @@ jobs:
             "args:${ARGS_OUTCOME}" \
             "timeout:${TIMEOUT_OUTCOME}" \
             "escape:${ESCAPE_OUTCOME}" \
+            "dotdot:${DOTDOT_OUTCOME}" \
+            "symlink:${SYMLINK_OUTCOME}" \
+            "version_file:${VERSION_FILE_OUTCOME}" \
             "bool:${BOOL_OUTCOME}" \
             "upload:${UPLOAD_OUTCOME}" \
             "target:${TARGET_OUTCOME}"; do

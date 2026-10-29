@@ -102,23 +102,104 @@ runs:
         # Validate inputs
         # Preflight: fail with a clear message when required tools are
         # missing (possible on minimal self-hosted runners)
-        for tool in realpath awk; do
-          if ! command -v "${tool}" > /dev/null 2>&1; then
-            echo "Error: required tool not found: ${tool} ❌"
-            echo "This action requires realpath (GNU coreutils)"
-            echo "and awk on the runner"
-            exit 1
-          fi
-        done
-        # Probe for GNU coreutils realpath: BSD/macOS realpath lacks
-        # the -m option, and later path resolution expects GNU
-        # behaviour; failing here gives a clearer error than a
-        # misleading mid-run resolution failure
-        if ! realpath -m -- / > /dev/null 2>&1; then
-          echo "Error: realpath does not support the -m option ❌"
-          echo "This action requires GNU coreutils realpath"
+        if ! command -v awk > /dev/null 2>&1; then
+          echo "Error: required tool not found: awk ❌"
+          echo "This action requires awk on the runner"
           exit 1
         fi
+        # Path resolution uses GNU realpath where it supports -m
+        # (Linux, Git Bash on Windows); BSD/macOS realpath lacks -m,
+        # so resolve_path falls back to readlink there
+        if realpath -m -- / > /dev/null 2>&1; then
+          gnu_realpath="true"
+        elif command -v readlink > /dev/null 2>&1; then
+          gnu_realpath="false"
+        else
+          echo "Error: required tool not found: readlink ❌"
+          echo "This action requires GNU realpath or readlink"
+          exit 1
+        fi
+        # resolve_path MODE PATH prints the canonical absolute PATH
+        #   missing: as GNU 'realpath -m'; missing components resolve
+        #            lexically, and every existing one is looked up,
+        #            even after a missing one, so a later '..' can
+        #            return to a symlink that still resolves
+        #   strict:  as GNU 'realpath'; only the last component may be
+        #            missing
+        # Uses GNU realpath where it supports -m (Linux, Git Bash on
+        # Windows), so those runners behave exactly as before; elsewhere
+        # (BSD/macOS realpath lacks -m) falls back to a pure-bash walk
+        # using readlink. Returns non-zero on failure, including more
+        # than 40 symlink hops; for a symlink loop GNU 'realpath -m'
+        # prints the path unchanged, where the fallback fails closed
+        resolve_path() {
+          local mode="$1" rest="$2" more=1 cur="" comp target hops=0
+          local missing=0
+          case "${mode}" in
+            missing|strict) ;;
+            *) return 2 ;;
+          esac
+          if [ "${gnu_realpath}" = "true" ]; then
+            if [ "${mode}" = "missing" ]; then
+              realpath -m -- "${rest}"
+            else
+              realpath -- "${rest}"
+            fi
+            return
+          fi
+          case "${rest}" in
+            /*) ;;
+            *) rest="$(pwd -P)/${rest}" ;;
+          esac
+          # Split on '/' with parameter expansion rather than read, which
+          # would stop at an embedded newline in the untrusted path
+          while [ "${more}" = 1 ]; do
+            case "${rest}" in
+              */*) comp="${rest%%/*}"; rest="${rest#*/}" ;;
+              *) comp="${rest}"; rest=""; more=0 ;;
+            esac
+            if [ "${mode}" = "strict" ]; then
+              # GNU realpath rejects anything after a missing component,
+              # and any component, even an empty one, after a file
+              if [ "${missing}" = 1 ]; then
+                [ -z "${comp}" ] || return 1
+              elif [ -n "${cur}" ] && [ ! -d "${cur}" ]; then
+                return 1
+              fi
+            fi
+            case "${comp}" in
+              ''|.) continue ;;
+              ..) cur="${cur%/*}"; continue ;;
+            esac
+            if [ -L "${cur}/${comp}" ]; then
+              hops=$((hops + 1))
+              [ "${hops}" -le 40 ] || return 1
+              # The trailing x keeps any newline that ends the link target
+              target="$(readlink -- "${cur}/${comp}" && printf x)" ||
+                return 1
+              target="${target%x}"
+              target="${target%$'\n'}"
+              [ -n "${target}" ] || return 1
+              case "${target}" in
+                /*) cur="" ;;
+              esac
+              if [ "${more}" = 1 ]; then
+                rest="${target}/${rest}"
+              else
+                rest="${target}"
+                more=1
+              fi
+              continue
+            fi
+            if [ -e "${cur}/${comp}" ]; then
+              cur="${cur}/${comp}"
+              continue
+            fi
+            missing=1
+            cur="${cur}/${comp}"
+          done
+          printf '%s\n' "${cur:-/}"
+        }
         # The workspace boundary checks depend on this runner
         # environment variable: an empty value would degrade the
         # case patterns to /* and disable the escape checks
@@ -226,19 +307,19 @@ runs:
         esac
         # Restrict the test run to the workspace: an absolute or
         # escaped path could otherwise read or write arbitrary runner
-        # filesystem locations. Canonicalize (realpath -m) and
+        # filesystem locations. Canonicalize (resolve_path missing) and
         # enforce the boundary BEFORE any existence probe so
         # traversal sequences cannot test for directories outside
         # the workspace, then re-check after resolving symlinks.
-        # Each realpath call fails closed: an empty result would
+        # Each resolve_path call fails closed: an empty result would
         # degrade the boundary case patterns to /* and disable the
         # escape checks
-        if ! candidate="$(realpath -m -- "${project_dir}")" ||
+        if ! candidate="$(resolve_path missing "${project_dir}")" ||
           [ -z "${candidate}" ]; then
           echo "Error: failed to resolve project directory ❌"
           exit 1
         fi
-        if ! workspace="$(realpath -- "${GITHUB_WORKSPACE}")" ||
+        if ! workspace="$(resolve_path strict "${GITHUB_WORKSPACE}")" ||
           [ -z "${workspace}" ]; then
           echo "Error: failed to resolve GITHUB_WORKSPACE ❌"
           exit 1
@@ -260,7 +341,7 @@ runs:
           printf 'Path not found: %s\n' "${sanitized}"
           exit 1
         fi
-        if ! resolved="$(realpath -- "${candidate}")" ||
+        if ! resolved="$(resolve_path strict "${candidate}")" ||
           [ -z "${resolved}" ]; then
           echo "Error: failed to resolve project directory ❌"
           exit 1
@@ -360,7 +441,7 @@ runs:
           # is documented as relative to path_prefix, so values
           # such as ../go.mod must not select a version file from
           # outside the project directory
-          if ! vf_candidate="$(realpath -m -- "${version_file}")" ||
+          if ! vf_candidate="$(resolve_path missing "${version_file}")" ||
             [ -z "${vf_candidate}" ]; then
             echo "Error: failed to resolve go_version_file ❌"
             exit 1
@@ -380,7 +461,7 @@ runs:
             printf 'Path not found: %s\n' "${sanitized}"
             exit 1
           fi
-          if ! vf_resolved="$(realpath -- "${vf_candidate}")" ||
+          if ! vf_resolved="$(resolve_path strict "${vf_candidate}")" ||
             [ -z "${vf_resolved}" ]; then
             echo "Error: failed to resolve go_version_file ❌"
             exit 1
@@ -481,19 +562,107 @@ runs:
           /*) ;;
           *) PROJECT_DIR="${GITHUB_WORKSPACE:?}/${PROJECT_DIR}" ;;
         esac
+        # Steps share no shell state, so repeat the validate step's
+        # realpath probe and resolve_path definition here
+        if realpath -m -- / > /dev/null 2>&1; then
+          gnu_realpath="true"
+        else
+          gnu_realpath="false"
+        fi
+        # resolve_path MODE PATH prints the canonical absolute PATH
+        #   missing: as GNU 'realpath -m'; missing components resolve
+        #            lexically, and every existing one is looked up,
+        #            even after a missing one, so a later '..' can
+        #            return to a symlink that still resolves
+        #   strict:  as GNU 'realpath'; only the last component may be
+        #            missing
+        # Uses GNU realpath where it supports -m (Linux, Git Bash on
+        # Windows), so those runners behave exactly as before; elsewhere
+        # (BSD/macOS realpath lacks -m) falls back to a pure-bash walk
+        # using readlink. Returns non-zero on failure, including more
+        # than 40 symlink hops; for a symlink loop GNU 'realpath -m'
+        # prints the path unchanged, where the fallback fails closed
+        resolve_path() {
+          local mode="$1" rest="$2" more=1 cur="" comp target hops=0
+          local missing=0
+          case "${mode}" in
+            missing|strict) ;;
+            *) return 2 ;;
+          esac
+          if [ "${gnu_realpath}" = "true" ]; then
+            if [ "${mode}" = "missing" ]; then
+              realpath -m -- "${rest}"
+            else
+              realpath -- "${rest}"
+            fi
+            return
+          fi
+          case "${rest}" in
+            /*) ;;
+            *) rest="$(pwd -P)/${rest}" ;;
+          esac
+          # Split on '/' with parameter expansion rather than read, which
+          # would stop at an embedded newline in the untrusted path
+          while [ "${more}" = 1 ]; do
+            case "${rest}" in
+              */*) comp="${rest%%/*}"; rest="${rest#*/}" ;;
+              *) comp="${rest}"; rest=""; more=0 ;;
+            esac
+            if [ "${mode}" = "strict" ]; then
+              # GNU realpath rejects anything after a missing component,
+              # and any component, even an empty one, after a file
+              if [ "${missing}" = 1 ]; then
+                [ -z "${comp}" ] || return 1
+              elif [ -n "${cur}" ] && [ ! -d "${cur}" ]; then
+                return 1
+              fi
+            fi
+            case "${comp}" in
+              ''|.) continue ;;
+              ..) cur="${cur%/*}"; continue ;;
+            esac
+            if [ -L "${cur}/${comp}" ]; then
+              hops=$((hops + 1))
+              [ "${hops}" -le 40 ] || return 1
+              # The trailing x keeps any newline that ends the link target
+              target="$(readlink -- "${cur}/${comp}" && printf x)" ||
+                return 1
+              target="${target%x}"
+              target="${target%$'\n'}"
+              [ -n "${target}" ] || return 1
+              case "${target}" in
+                /*) cur="" ;;
+              esac
+              if [ "${more}" = 1 ]; then
+                rest="${target}/${rest}"
+              else
+                rest="${target}"
+                more=1
+              fi
+              continue
+            fi
+            if [ -e "${cur}/${comp}" ]; then
+              cur="${cur}/${comp}"
+              continue
+            fi
+            missing=1
+            cur="${cur}/${comp}"
+          done
+          printf '%s\n' "${cur:-/}"
+        }
         # Re-resolve and enforce the workspace boundary at the point
         # of use: the workspace is mutable between steps, so relying
         # solely on the earlier validate step would leave a TOCTOU
         # gap (a validated directory swapped for an escaping symlink)
-        # Each realpath call fails closed: an empty result would
+        # Each resolve_path call fails closed: an empty result would
         # degrade the boundary case pattern to /* and disable the
         # escape check
-        if ! PROJECT_DIR="$(realpath -- "${PROJECT_DIR}")" ||
+        if ! PROJECT_DIR="$(resolve_path strict "${PROJECT_DIR}")" ||
           [ -z "${PROJECT_DIR}" ]; then
           echo "Error: failed to resolve project directory ❌"
           exit 1
         fi
-        if ! boundary="$(realpath -- "${GITHUB_WORKSPACE:?}")" ||
+        if ! boundary="$(resolve_path strict "${GITHUB_WORKSPACE:?}")" ||
           [ -z "${boundary}" ]; then
           echo "Error: failed to resolve GITHUB_WORKSPACE ❌"
           exit 1
