@@ -20,6 +20,19 @@ concurrency:
 permissions: {}
 
 jobs:
+  # Both harden-runner actions support Linux runners only, and a
+  # step-level "if: runner.os == 'Linux'" cannot keep them off other
+  # runners: step-security/harden-runner declares a pre step with no
+  # pre-if, so that pre step runs whatever the step's if says. On
+  # Windows it moves DNS to a local proxy, which a short job can stop
+  # before the proxy is ready, leaving the runner hanging at cleanup.
+  # The test-synthetic and test-failures jobs therefore run on Linux
+  # only, with both harden-runner steps, and a matching job without
+  # them runs the same steps on macOS and Windows. Each shared step
+  # carries a YAML anchor in the Linux job and an alias in the
+  # macOS/Windows job, so a step changes in one place; add any new
+  # step to both lists.
+
   ### Test runs against the synthetic Go fixture ###
   test-synthetic:
     name: "Test: synthetic fixture (test-go-project, ${{ matrix.os }})"
@@ -27,9 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macOS runs the pure-bash path resolver, since BSD realpath
-        # lacks -m; Windows runs GNU realpath from Git Bash
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest]
     permissions:
       contents: read
     timeout-minutes: 15
@@ -37,16 +48,13 @@ jobs:
       # Load the egress allow-list out-of-band from the
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
-      # Both harden-runner actions support Linux runners only.
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
-        if: runner.os == 'Linux'
         with:
           config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
-        if: runner.os == 'Linux'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
@@ -54,7 +62,8 @@ jobs:
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
-      - name: "Checkout test project: lfreleng-actions/test-go-project"
+      - &synthetic-checkout
+        name: "Checkout test project: lfreleng-actions/test-go-project"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: lfreleng-actions/test-go-project
@@ -62,13 +71,15 @@ jobs:
           path: test-project
           persist-credentials: false
 
-      - name: "Running local action: coverage and race defaults"
+      - &default-test
+        name: "Running local action: coverage and race defaults"
         id: default-test
         uses: $/
         with:
           path_prefix: test-project
 
-      - name: "Running local action: plain run without coverage"
+      - &plain-test
+        name: "Running local action: plain run without coverage"
         id: plain-test
         uses: $/
         with:
@@ -79,7 +90,8 @@ jobs:
           test_target: './pkg/...'
           timeout: '5m'
 
-      - name: "Running local action: coverage artifact upload"
+      - &coverage-artifact
+        name: "Running local action: coverage artifact upload"
         id: coverage-artifact
         uses: $/
         with:
@@ -90,7 +102,8 @@ jobs:
       # cli-test compiles the binary before exercising it, standing in
       # for projects that must build before they can test; naming two
       # targets also covers multi-word make_args
-      - name: "Running local action: build+test via make"
+      - &make-test
+        name: "Running local action: build+test via make"
         id: make-test
         uses: $/
         with:
@@ -100,7 +113,8 @@ jobs:
       # A missing target makes make exit non-zero whatever the fixture
       # code does, so the make path's permit_fail handling is tested
       # deterministically
-      - name: "Running local action: make soft fail"
+      - &make-soft-fail
+        name: "Running local action: make soft fail"
         id: make-soft-fail
         uses: $/
         with:
@@ -108,7 +122,8 @@ jobs:
           make_args: 'no-such-target'
           permit_fail: 'true'
 
-      - name: "Running local action: make hard fail"
+      - &make-hard-fail
+        name: "Running local action: make hard fail"
         id: make-hard-fail
         continue-on-error: true
         uses: $/
@@ -116,7 +131,8 @@ jobs:
           path_prefix: test-project
           make_args: 'no-such-target'
 
-      - name: "Verify test outputs"
+      - &synthetic-verify
+        name: "Verify test outputs"
         shell: bash
         env:
           DEFAULT_PASSED: ${{ steps.default-test.outputs.tests_passed }}
@@ -186,6 +202,30 @@ jobs:
             echo "Test outputs verified ✅"
             echo "Coverage reported: ${DEFAULT_COVERAGE}%"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # The test-synthetic steps on macOS and Windows, without
+  # harden-runner; see the note above the jobs
+  test-synthetic-macos-windows:
+    name: "Test: synthetic fixture (test-go-project, ${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS runs the pure-bash path resolver, since BSD realpath
+        # lacks -m; Windows runs GNU realpath from Git Bash
+        os: [macos-latest, windows-latest]
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - *synthetic-checkout
+      - *default-test
+      - *plain-test
+      - *coverage-artifact
+      - *make-test
+      - *make-soft-fail
+      - *make-hard-fail
+      - *synthetic-verify
 
   ### Test runs against a real Gerrit-mirrored monorepo ###
   test-real:
@@ -310,7 +350,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest]
     permissions:
       contents: read
     timeout-minutes: 10
@@ -318,16 +358,13 @@ jobs:
       # Load the egress allow-list out-of-band from the
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
-      # Both harden-runner actions support Linux runners only.
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8 # v0.14.0
-        if: runner.os == 'Linux'
         with:
           config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
 
       # Harden the runner with the just-loaded allow-list.
       - name: "Harden runner (block)"
-        if: runner.os == 'Linux'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
@@ -335,21 +372,24 @@ jobs:
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
-      - name: "Running local action with shell metacharacter args"
+      - &bad-args
+        name: "Running local action with shell metacharacter args"
         id: bad-args
         continue-on-error: true
         uses: $/
         with:
           test_args: '-run $(id)'
 
-      - name: "Running local action with invalid timeout"
+      - &bad-timeout
+        name: "Running local action with invalid timeout"
         id: bad-timeout
         continue-on-error: true
         uses: $/
         with:
           timeout: '10 minutes'
 
-      - name: "Running local action with workspace-escaping path"
+      - &escape-path
+        name: "Running local action with workspace-escaping path"
         id: escape-path
         continue-on-error: true
         uses: $/
@@ -365,7 +405,8 @@ jobs:
       # the same version file. Git Bash copies rather than links
       # unless native symlinks are available, so Windows skips the
       # symlink cases when it cannot create real ones
-      - name: "Create symlink fixtures"
+      - &links
+        name: "Create symlink fixtures"
         id: links
         shell: bash
         env:
@@ -412,14 +453,16 @@ jobs:
             exit 1
           fi
 
-      - name: "Running local action with dot-dot escaping path"
+      - &escape-dotdot
+        name: "Running local action with dot-dot escaping path"
         id: escape-dotdot
         continue-on-error: true
         uses: $/
         with:
           path_prefix: fixture-dir/../../dotdot-project
 
-      - name: "Running local action with symlink escaping workspace"
+      - &escape-symlink
+        name: "Running local action with symlink escaping workspace"
         id: escape-symlink
         if: steps.links.outputs.symlinks == 'true'
         continue-on-error: true
@@ -427,7 +470,8 @@ jobs:
         with:
           path_prefix: escape-link
 
-      - name: "Running local action with symlink go_version_file"
+      - &escape-version-file
+        name: "Running local action with symlink go_version_file"
         id: escape-version-file
         if: steps.links.outputs.symlinks == 'true'
         continue-on-error: true
@@ -438,7 +482,8 @@ jobs:
 
       # Positive control: the escape fixtures are runnable, so their
       # rejections above come from the boundary checks alone
-      - name: "Running local action on symlink fixture project"
+      - &fixture-control
+        name: "Running local action on symlink fixture project"
         id: fixture-control
         if: steps.links.outputs.symlinks == 'true'
         continue-on-error: true
@@ -449,7 +494,8 @@ jobs:
       # GNU 'realpath -m' resolves link after the missing component's
       # '..', selecting nested/go.mod (go 1.25), not the project's
       # go.mod (go 1.24); the macOS fallback must agree
-      - name: "Running local action with dot-dot through a symlink"
+      - &resolve-dotdot
+        name: "Running local action with dot-dot through a symlink"
         id: resolve-dotdot
         if: steps.links.outputs.symlinks == 'true'
         continue-on-error: true
@@ -458,7 +504,8 @@ jobs:
           path_prefix: resolve-project
           go_version_file: absent/../link/../go.mod
 
-      - name: "Verify fixture runs and resolved Go version"
+      - &verify-fixtures
+        name: "Verify fixture runs and resolved Go version"
         if: steps.links.outputs.symlinks == 'true'
         shell: bash
         working-directory: ${{ runner.temp }}
@@ -496,14 +543,16 @@ jobs:
           echo "Fixture runs and resolved Go version verified ✅" \
             >> "$GITHUB_STEP_SUMMARY"
 
-      - name: "Running local action with invalid boolean"
+      - &bad-bool
+        name: "Running local action with invalid boolean"
         id: bad-bool
         continue-on-error: true
         uses: $/
         with:
           coverage: 'yes'
 
-      - name: "Running local action with upload but no coverage"
+      - &upload-no-coverage
+        name: "Running local action with upload but no coverage"
         id: upload-no-coverage
         continue-on-error: true
         uses: $/
@@ -511,14 +560,16 @@ jobs:
           coverage: 'false'
           artifact_upload: 'true'
 
-      - name: "Running local action with flag-like test target"
+      - &bad-target
+        name: "Running local action with flag-like test target"
         id: bad-target
         continue-on-error: true
         uses: $/
         with:
           test_target: '-x'
 
-      - name: "Verify invalid inputs were rejected"
+      - &verify-rejected
+        name: "Verify invalid inputs were rejected"
         shell: bash
         env:
           ARGS_OUTCOME: ${{ steps.bad-args.outcome }}
@@ -557,3 +608,31 @@ jobs:
           echo "Invalid inputs correctly rejected ✅"
           echo "Invalid inputs correctly rejected ✅" \
             >> "$GITHUB_STEP_SUMMARY"
+
+  # The test-failures steps on macOS and Windows, without
+  # harden-runner; see the note above the jobs
+  test-failures-macos-windows:
+    name: "Test: invalid inputs and error handling (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - *bad-args
+      - *bad-timeout
+      - *escape-path
+      - *links
+      - *escape-dotdot
+      - *escape-symlink
+      - *escape-version-file
+      - *fixture-control
+      - *resolve-dotdot
+      - *verify-fixtures
+      - *bad-bool
+      - *upload-no-coverage
+      - *bad-target
+      - *verify-rejected
